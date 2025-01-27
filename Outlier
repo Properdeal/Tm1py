@@ -1,0 +1,158 @@
+import pandas as pd
+import numpy as np
+from itertools import product
+from TM1py import TM1Service
+
+# Step 1: Handle Missing Dates and Values
+def handle_missing_dates_and_values(data, all_dates, all_combinations):
+    """
+    Fills in missing dates and values for each combination of items, locations, and customers.
+    
+    Parameters:
+    data (pd.DataFrame): The original dataset.
+    all_dates (pd.DatetimeIndex): A range of all possible dates.
+    all_combinations (list): Lists of unique items, locations, and customers.
+    
+    Returns:
+    pd.DataFrame: The dataset with missing dates and values filled in.
+    """
+    full_data = pd.DataFrame(list(product(all_dates, *all_combinations)), columns=["Date", "Item", "Location", "Customer"])
+    merged_data = pd.merge(full_data, data, on=["Date", "Item", "Location", "Customer"], how="left")
+    merged_data["Sales"] = merged_data["Sales"].fillna(0)
+    return merged_data
+
+# Step 2: Outlier Detection and Replacement
+def process_outliers(data, params, default_params):
+    """
+    Detects and replaces outliers in the sales data based on specified methods and thresholds.
+    
+    Parameters:
+    data (pd.DataFrame): The dataset with sales data.
+    params (pd.DataFrame): Outlier detection parameters for each item, location, and customer.
+    default_params (pd.DataFrame): Default parameters for outlier detection.
+    
+    Returns:
+    pd.DataFrame: The dataset with outliers detected and replaced.
+    """
+    results = []
+    for _, group in data.groupby(["Item", "Location", "Customer"]):
+        group = group.copy()
+
+        param_row = params[
+            (params["Item"] == group["Item"].iloc[0]) &
+            (params["Location"] == group["Location"].iloc[0]) &
+            (params["Customer"] == group["Customer"].iloc[0])
+        ]
+
+        if param_row.empty:
+            threshold = default_params["Threshold"].iloc[0]
+            method = default_params["Method"].iloc[0]
+            correction = default_params["Correction"].iloc[0]
+        else:
+            threshold = param_row["Threshold"].iloc[0]
+            method = param_row["Method"].iloc[0]
+            correction = param_row["Correction"].iloc[0]
+
+        sales = group["Sales"]
+
+        if method == "Seasonal IQR":
+            Q1 = sales.quantile(0.25)
+            Q3 = sales.quantile(0.75)
+            IQR = Q3 - Q1
+            lower_threshold = Q1 - threshold * IQR
+            upper_threshold = Q3 + threshold * IQR
+        elif method == "Fixed Sigma":
+            mean = sales.mean()
+            std = sales.std()
+            lower_threshold = mean - threshold * std
+            upper_threshold = mean + threshold * std
+        elif method == "Rolling Sigma":
+            rolling_mean = sales.rolling(window=7, min_periods=1).mean()
+            rolling_std = sales.rolling(window=7, min_periods=1).std()
+            lower_threshold = rolling_mean - threshold * rolling_std
+            upper_threshold = rolling_mean + threshold * rolling_std
+        elif method == "MAD":
+            median = sales.median()
+            mad = (np.abs(sales - median)).median()
+            lower_threshold = median - threshold * mad
+            upper_threshold = median + threshold * mad
+        elif method == "EWMA":
+            ewma = sales.ewm(span=7, adjust=False).mean()
+            std = sales.ewm(span=7, adjust=False).std()
+            lower_threshold = ewma - threshold * std
+            upper_threshold = ewma + threshold * std
+        else:
+            raise ValueError("Invalid method")
+
+        # Outlier detection
+        group["Is_Outlier"] = (sales < lower_threshold) | (sales > upper_threshold)
+
+        # Track original sales for outliers
+        group["Previous_Sales"] = group["Sales"].where(group["Is_Outlier"])
+
+        # Apply correction
+        if correction == "Limit":
+            group.loc[group["Is_Outlier"], "Sales"] = np.where(
+                group.loc[group["Is_Outlier"], "Sales"] < lower_threshold,
+                lower_threshold,
+                upper_threshold
+            )
+        elif correction == "Interpolation":
+            outliers = group["Is_Outlier"]
+            group.loc[outliers, "Sales"] = np.nan
+            group["Sales"] = group["Sales"].interpolate(method="linear").fillna(0)
+
+        # Rename 'Sales' to 'Final_Sales' for clarity
+        group.rename(columns={"Sales": "Final_Sales"}, inplace=True)
+        results.append(group)
+
+    return pd.concat(results, ignore_index=True)
+
+# Step 3: Main Function to Run the Workflow
+def main():
+    # TM1 connection details
+    tm1_credentials = {
+        "address": "localhost",  # TM1 server address
+        "port": 12354,          # TM1 HTTPPortNumber
+        "user": "admin",        # TM1 username
+        "password": "apple",    # TM1 password
+        "ssl": True             # Use SSL
+    }
+
+    # Connect to TM1
+    with TM1Service(**tm1_credentials) as tm1:
+        # Fetch data from the cube
+        cube_name = "SalesCube"
+        view_name = "Default"  # Use a pre-defined view or create an MDX query
+        data = tm1.cubes.cells.execute_view_dataframe(cube_name, view_name)
+
+    # Convert data to the expected format
+    data.reset_index(inplace=True)
+    data.columns = ["Date", "Item", "Location", "Customer", "Sales"]
+
+    # Load outlier parameters and default parameters from CSV files
+    params = pd.read_csv("file2_outlier_parameters.csv")
+    default_params = pd.read_csv("file3_default_parameters.csv")
+
+    # Generate a list of all possible dates, items, locations, and customers
+    all_dates = pd.date_range(data["Date"].min(), data["Date"].max(), freq="D")
+    all_combinations = [
+        data["Item"].unique(),
+        data["Location"].unique(),
+        data["Customer"].unique()
+    ]
+
+    # Handle missing dates and values
+    complete_data = handle_missing_dates_and_values(data, all_dates, all_combinations)
+
+    # Detect and replace outliers
+    result = process_outliers(complete_data, params, default_params)
+
+    # Save results
+    output_file = "processed_outlier_data.csv"
+    result.to_csv(output_file, index=False)
+    print(f"Outlier detection completed! Results saved to '{output_file}'.")
+
+# Run the main function
+if __name__ == "__main__":
+    main()
